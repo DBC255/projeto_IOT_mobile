@@ -1,89 +1,165 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
-  Pressable,
   RefreshControl,
   SafeAreaView,
+  StatusBar,
   StyleSheet,
   Switch,
-  TextInput,
   Text,
+  TouchableOpacity,
   View,
 } from 'react-native';
 
-type SensorStatus = boolean | number;
+/* -------------------------------------------------------------------------- */
+/* Configuração da API                                                         */
+/* -------------------------------------------------------------------------- */
 
-type Sensor = {
+const BASE_URL = 'http://10.137.11.6';
+
+// ⚠️ Ajuste estes dois caminhos para as rotas reais do seu backend.
+// (As URLs de listagem e atualização chegaram truncadas na mensagem,
+// então usei como base o padrão da rota de visualização:
+// /api/sensor/status/visualizar/s1)
+const LIST_PATH = '/api/sensor/status/listar';
+const UPDATE_PATH = '/api/sensor/status/atualizar';
+
+const REQUEST_TIMEOUT_MS = 8000;
+
+/* -------------------------------------------------------------------------- */
+/* Tipos                                                                       */
+/* -------------------------------------------------------------------------- */
+
+type RawStatus = number | boolean | string;
+
+interface ApiSensor {
   codigo: string;
   tipo: string;
-  status: SensorStatus;
-};
-
-type SensorDashboardProps = {
-  apiBaseUrl?: string;
-};
-
-const DEFAULT_API_BASE_URL = 'http://10.137.11';
-const SENSOR_LIST_PATH = '/api/sensor/status/listar';
-const SENSOR_VIEW_PATH = '/api/sensor/status/visualizar';
-const SENSOR_UPDATE_PATH = '/api/sensor/status/atualizar';
-
-function apiEndpoint(baseUrl: string, path: string): string {
-  return `${baseUrl.replace(/\/+$/, '')}${path}`;
+  status: RawStatus;
 }
 
-function isActive(status: SensorStatus): boolean {
-  if (typeof status === 'boolean') return status;
-  return Number(status) !== 0 && Number.isFinite(Number(status));
+interface Sensor {
+  codigo: string;
+  tipo: string;
+  ativo: boolean;
 }
 
-function readSensorList(payload: unknown): Sensor[] {
-  // Ajustado para ler o JSON direto do Insomnia ou empacotado em .data
-  const data = Array.isArray(payload) 
-    ? payload 
-    : (payload as { data?: unknown } | null)?.data;
+interface ListResponse {
+  data: ApiSensor[];
+}
 
-  if (!Array.isArray(data)) {
-    throw new Error('A resposta da API não contém uma lista válida de sensores.');
+interface UpdateResponse {
+  status: boolean;
+  message: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                     */
+/* -------------------------------------------------------------------------- */
+
+// O backend pode devolver 0/1, true/false ou "0"/"1". Normalizamos tudo para boolean.
+const toBoolean = (value: RawStatus): boolean => {
+  if (typeof value === 'string') {
+    return value === '1' || value.toLowerCase() === 'true';
   }
+  return Boolean(value);
+};
 
-  return data.map((item, index) => {
-    const sensor = item as Partial<Sensor>;
-    if (typeof sensor.codigo !== 'string' || typeof sensor.tipo !== 'string') {
-      throw new Error(`Os dados do sensor ${index + 1} estão incompletos.`);
+const toSensor = (item: ApiSensor): Sensor => ({
+  codigo: item.codigo,
+  tipo: item.tipo,
+  ativo: toBoolean(item.status),
+});
+
+
+const capitalize = (text: string) =>
+  text.length ? text.charAt(0).toUpperCase() + text.slice(1) : text;
+
+// fetch com timeout, para não deixar o app preso caso o servidor não responda.
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${BASE_URL}${path}`, {
+      ...options,
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        ...(options.headers ?? {}),
+      },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
     }
-    if (typeof sensor.status !== 'boolean' && typeof sensor.status !== 'number') {
-      throw new Error(`O status do sensor ${sensor.codigo} está incompleto.`);
-    }
-    return {
-      codigo: sensor.codigo,
-      tipo: sensor.tipo,
-      status: sensor.status,
-    };
-  });
+    return (await response.json()) as T;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-export default function SensorDashboard({
-  apiBaseUrl = DEFAULT_API_BASE_URL,
-}: SensorDashboardProps) {
+/* -------------------------------------------------------------------------- */
+/* Componente do item da lista                                                 */
+/* -------------------------------------------------------------------------- */
+
+interface SensorCardProps {
+  sensor: Sensor;
+  pending: boolean;
+  onToggle: (sensor: Sensor) => void;
+}
+
+const SensorCard = React.memo(({ sensor, pending, onToggle }: SensorCardProps) => {
+  const color = sensor.ativo ? COLORS.active : COLORS.inactive;
+
+  return (
+    <View style={[styles.card, { borderLeftColor: color }]}>
+      <View style={[styles.iconWrap, { backgroundColor: sensor.ativo ? COLORS.activeSoft : COLORS.inactiveSoft }]}>
+      </View>
+
+      <View style={styles.info}>
+        <Text style={styles.code}>{sensor.codigo}</Text>
+        <Text style={styles.type}>{capitalize(sensor.tipo)}</Text>
+
+        <View style={styles.statusRow}>
+          <View style={[styles.dot, { backgroundColor: color }]} />
+          <Text style={[styles.statusText, { color }]}>
+            {sensor.ativo ? 'Ativo' : 'Inativo'}
+          </Text>
+        </View>
+      </View>
+
+      <View style={styles.action}>
+        {pending ? (
+          <ActivityIndicator size="small" color={COLORS.ink} />
+        ) : (
+          <Switch
+            value={sensor.ativo}
+            onValueChange={() => onToggle(sensor)}
+            trackColor={{ false: COLORS.inactiveSoft, true: COLORS.active }}
+            thumbColor="#FFFFFF"
+            ios_backgroundColor={COLORS.inactiveSoft}
+            accessibilityLabel={`Alternar sensor ${sensor.codigo}`}
+          />
+        )}
+      </View>
+    </View>
+  );
+});
+
+/* -------------------------------------------------------------------------- */
+/* Tela principal                                                              */
+/* -------------------------------------------------------------------------- */
+
+export default function SensorDashboard() {
   const [sensors, setSensors] = useState<Sensor[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [updatingCodes, setUpdatingCodes] = useState<string[]>([]);
-  const [checkingCodes, setCheckingCodes] = useState<string[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [refreshing, setRefreshing] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
-  const [searchTerm, setSearchTerm] = useState('');
-
-  const filteredSensors = useMemo(() => {
-    const query = searchTerm.trim().toLocaleLowerCase('pt-BR');
-    if (!query) return sensors;
-
-    return sensors.filter((sensor) =>
-      sensor.codigo.toLocaleLowerCase('pt-BR') === query ||
-      sensor.tipo.toLocaleLowerCase('pt-BR').includes(query),
-    );
-  }, [searchTerm, sensors]);
+  const [pendingCodes, setPendingCodes] = useState<string[]>([]);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const loadSensors = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true);
@@ -91,286 +167,273 @@ export default function SensorDashboard({
     setError(null);
 
     try {
-      const response = await fetch(
-        apiEndpoint(apiBaseUrl, SENSOR_LIST_PATH),
-      );
-      if (!response.ok) {
-        throw new Error(`O servidor respondeu com o erro ${response.status}.`);
-      }
-      const payload: unknown = await response.json();
-      setSensors(readSensorList(payload));
-    } catch (err) {
+      const json = await request<ListResponse>(LIST_PATH);
+      setSensors((json.data ?? []).map(toSensor));
+    } catch {
       setError(
-        err instanceof Error
-          ? `Não foi possível carregar os sensores. ${err.message}`
-          : 'Não foi possível carregar os sensores. Verifique a conexão com a API.',
+        'Não foi possível carregar os sensores. Verifique se o celular está na mesma rede do servidor e tente de novo.'
       );
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [apiBaseUrl]);
+  }, []);
 
   useEffect(() => {
-    void loadSensors();
+    loadSensors();
   }, [loadSensors]);
 
-  const refreshSensorStatus = async (sensor: Sensor) => {
-    if (checkingCodes.includes(sensor.codigo)) return;
-    setCheckingCodes((current) => [...current, sensor.codigo]);
-    setError(null);
+  const setSensorState = (codigo: string, ativo: boolean) =>
+    setSensors((prev) => prev.map((s) => (s.codigo === codigo ? { ...s, ativo } : s)));
+
+  const handleToggle = useCallback(async (sensor: Sensor) => {
+    const novoStatus = !sensor.ativo;
+    setActionError(null);
+
+    // Atualização otimista: a interface muda na hora.
+    setSensorState(sensor.codigo, novoStatus);
+    setPendingCodes((prev) => [...prev, sensor.codigo]);
 
     try {
-      const code = encodeURIComponent(sensor.codigo.toLowerCase());
-      const response = await fetch(
-        `${apiEndpoint(apiBaseUrl, SENSOR_VIEW_PATH)}/${code}`,
-      );
-      if (!response.ok) {
-        throw new Error(`O servidor respondeu com o erro ${response.status}.`);
-      }
+      const result = await request<UpdateResponse>(UPDATE_PATH, {
+        method: 'PUT',
+        body: JSON.stringify({ codigo: sensor.codigo, status: novoStatus }),
+      });
 
-      const result = (await response.json()) as { status?: SensorStatus };
-      if (typeof result.status !== 'boolean' && typeof result.status !== 'number') {
-        throw new Error('A resposta não contém um status válido.');
+      if (!result.status) {
+        throw new Error(result.message);
       }
-
-      setSensors((current) =>
-        current.map((item) =>
-          item.codigo === sensor.codigo ? { ...item, status: result.status! } : item,
-        ),
-      );
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? `Não foi possível consultar ${sensor.codigo}. ${err.message}`
-          : `Não foi possível consultar ${sensor.codigo}. Verifique a conexão com a API.`,
-      );
+    } catch {
+      // Se o backend falhar, desfazemos a mudança na interface.
+      setSensorState(sensor.codigo, sensor.ativo);
+      setActionError(`Não foi possível atualizar o sensor ${sensor.codigo}. Tente novamente.`);
     } finally {
-      setCheckingCodes((current) => current.filter((code) => code !== sensor.codigo));
+      setPendingCodes((prev) => prev.filter((c) => c !== sensor.codigo));
     }
-  };
+  }, []);
 
-  const toggleSensor = async (sensor: Sensor) => {
-    const previousStatus = sensor.status;
-    const nextStatus = !isActive(previousStatus);
+  const activeCount = sensors.filter((s) => s.ativo).length;
 
-    setSensors((current) =>
-      current.map((item) =>
-        item.codigo === sensor.codigo ? { ...item, status: nextStatus } : item,
-      ),
-    );
-    setUpdatingCodes((current) => [...current, sensor.codigo]);
-    setError(null);
+  /* ------------------------------- Estados ------------------------------- */
 
-    try {
-      const response = await fetch(
-        apiEndpoint(apiBaseUrl, SENSOR_UPDATE_PATH),
-        {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ codigo: sensor.codigo.toLowerCase(), status: nextStatus }),
-        },
-      );
-      if (!response.ok) {
-        throw new Error(`O servidor respondeu com o erro ${response.status}.`);
-      }
-
-      const result = (await response.json()) as { status?: SensorStatus };
-      if (result.status !== undefined) {
-        setSensors((current) =>
-          current.map((item) =>
-            item.codigo === sensor.codigo ? { ...item, status: result.status! } : item,
-          ),
-        );
-      }
-    } catch (err) {
-      setSensors((current) =>
-        current.map((item) =>
-          item.codigo === sensor.codigo ? { ...item, status: previousStatus } : item,
-        ),
-      );
-      setError(
-        err instanceof Error
-          ? `Não foi possível atualizar ${sensor.codigo}. ${err.message}`
-          : `Não foi possível atualizar ${sensor.codigo}. Tente novamente.`,
-      );
-    } finally {
-      setUpdatingCodes((current) => current.filter((code) => code !== sensor.codigo));
-    }
-  };
-
-  const renderSensor = ({ item }: { item: Sensor }) => {
-    const active = isActive(item.status);
-    const updating = updatingCodes.includes(item.codigo);
-    const checking = checkingCodes.includes(item.codigo);
-
+  if (loading) {
     return (
-      <View style={styles.card}>
-        <View style={styles.sensorInfo}>
-          <View style={styles.titleRow}>
-            <Text style={styles.sensorCode}>{item.codigo.toUpperCase()}</Text>
-            <View style={[styles.statusBadge, active ? styles.activeBadge : styles.inactiveBadge]}>
-              <View style={[styles.statusDot, active ? styles.activeDot : styles.inactiveDot]} />
-              <Text style={[styles.statusText, active ? styles.activeText : styles.inactiveText]}>
-                {active ? 'ATIVO' : 'INATIVO'}
-              </Text>
-            </View>
-          </View>
-          <Text style={styles.sensorType}>{item.tipo}</Text>
-        </View>
-
-        <View style={styles.controlRow}>
-          <View style={styles.switchContainer}>
-            {updating ? (
-              <ActivityIndicator size="small" color="#0284C7" />
-            ) : (
-              <Switch
-                accessibilityLabel={`Alternar sensor ${item.codigo}`}
-                value={active}
-                onValueChange={() => void toggleSensor(item)}
-                trackColor={{ false: '#E2E8F0', true: '#BAE6FD' }}
-                thumbColor={active ? '#0284C7' : '#94A3B8'}
-              />
-            )}
-          </View>
-          
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={`Consultar status de ${item.codigo}`}
-            disabled={checking}
-            onPress={() => void refreshSensorStatus(item)}
-            style={[styles.queryButton, checking && styles.queryButtonDisabled]}
-          >
-            {checking ? (
-              <ActivityIndicator size="small" color="#FFFFFF" />
-            ) : (
-              <Text style={styles.queryButtonText}>Atualizar</Text>
-            )}
-          </Pressable>
-        </View>
-      </View>
+      <SafeAreaView style={[styles.container, styles.centered]}>
+        <ActivityIndicator size="large" color={COLORS.ink} />
+        <Text style={styles.helper}>Buscando sensores…</Text>
+      </SafeAreaView>
     );
-  };
+  }
+
+  if (error) {
+    return (
+      <SafeAreaView style={[styles.container, styles.centered]}>
+        <Text style={styles.errorTitle}>Sem conexão com o servidor</Text>
+        <Text style={styles.helper}>{error}</Text>
+        <TouchableOpacity style={styles.retryButton} onPress={() => loadSensors()} activeOpacity={0.8}>
+          <Text style={styles.retryText}>Tentar novamente</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
+  /* ------------------------------- Lista --------------------------------- */
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <View style={styles.container}>
-        <View style={styles.header}>
-          <Text style={styles.heading}>Painel de Sensores</Text>
-          <Text style={styles.subtitle}>Gerenciamento de dispositivos em tempo real.</Text>
-        </View>
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="dark-content" backgroundColor={COLORS.paper} />
 
-        <View style={styles.searchBox}>
-          <Text style={styles.searchIcon}>🔍</Text>
-          <TextInput
-            accessibilityLabel="Buscar sensor por código ou tipo"
-            placeholder="Filtrar por código ou tipo..."
-            placeholderTextColor="#94A3B8"
-            value={searchTerm}
-            onChangeText={setSearchTerm}
-            autoCapitalize="characters"
-            autoCorrect={false}
-            returnKeyType="search"
-            style={styles.searchInput}
+      <View style={styles.header}>
+        <Text style={styles.title}>Sensores</Text>
+        <Text style={styles.subtitle}>
+          {sensors.length === 0
+            ? 'Nenhum sensor cadastrado'
+            : `${activeCount} de ${sensors.length} ativos`}
+        </Text>
+      </View>
+
+      {actionError && (
+        <View style={styles.banner}>
+          <Text style={styles.bannerText}>{actionError}</Text>
+        </View>
+      )}
+
+      <FlatList
+        data={sensors}
+        keyExtractor={(item) => item.codigo}
+        renderItem={({ item }) => (
+          <SensorCard
+            sensor={item}
+            pending={pendingCodes.includes(item.codigo)}
+            onToggle={handleToggle}
           />
-          {searchTerm.length > 0 ? (
-            <Pressable onPress={() => setSearchTerm('')} hitSlop={8}>
-              <Text style={styles.clearSearch}>Limpar</Text>
-            </Pressable>
-          ) : null}
-        </View>
-
-        {error ? (
-          <View style={styles.errorBox}>
-            <Text style={styles.errorText}>{error}</Text>
-            <Pressable onPress={() => void loadSensors()} style={styles.retryButton}>
-              <Text style={styles.retryText}>Recarregar Lista</Text>
-            </Pressable>
+        )}
+        contentContainerStyle={styles.listContent}
+        ItemSeparatorComponent={() => <View style={styles.separator} />}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={() => loadSensors(true)}
+            tintColor={COLORS.ink}
+            colors={[COLORS.ink]}
+          />
+        }
+        ListEmptyComponent={
+          <View style={styles.centered}>
+            <Text style={styles.helper}>Puxe a lista para baixo para atualizar.</Text>
           </View>
-        ) : null}
-
-        {loading ? (
-          <View style={styles.loading}>
-            <ActivityIndicator size="large" color="#0284C7" />
-            ) : (
-<FlatList
-data={filteredSensors}
-keyExtractor={(item) => item.codigo}
-renderItem={renderSensor}
-contentContainerStyle={filteredSensors.length === 0 ? styles.emptyList : styles.list}
-refreshControl={
-<RefreshControl refreshing={refreshing} onRefresh={() => void loadSensors(true)} colors={['#0284C7']} />
+        }
+      />
+    </SafeAreaView>
+  );
 }
-ListEmptyComponent={
-}
-showsVerticalScrollIndicator={false}
-/>
-)}
 
+/* -------------------------------------------------------------------------- */
+/* Estilos                                                                     */
+/* -------------------------------------------------------------------------- */
 
-);
-}
+const COLORS = {
+  paper: '#F3F5F2',
+  card: '#FFFFFF',
+  ink: '#16302B',
+  muted: '#66736F',
+  active: '#1E9E6F',
+  activeSoft: '#DDF3EA',
+  inactive: '#8A9591',
+  inactiveSoft: '#E3E7E4',
+  danger: '#B3372D',
+  dangerSoft: '#FBE7E4',
+};
+
 const styles = StyleSheet.create({
-safeArea: { flex: 1, backgroundColor: '#F8FAFC' },
-container: { flex: 1, paddingHorizontal: 16 },
-header: { paddingTop: 24, paddingBottom: 16, borderBottomWidth: 1, borderBottomColor: '#E2E8F0', marginBottom: 16 },
-heading: { color: '#0F172A', fontSize: 24, fontWeight: '700' },
-subtitle: { color: '#64748B', fontSize: 14, marginTop: 4 },
-searchBox: {
-alignItems: 'center',
-backgroundColor: '#FFFFFF',
-borderColor: '#CBD5E1',
-borderRadius: 8,
-borderWidth: 1,
-flexDirection: 'row',
-marginBottom: 16,
-minHeight: 44,
-paddingHorizontal: 12,
-},
-searchIcon: { fontSize: 16, marginRight: 8, color: '#64748B' },
-searchInput: { color: '#0F172A', flex: 1, fontSize: 14, paddingVertical: 8 },
-clearSearch: { color: '#0284C7', fontSize: 13, fontWeight: '600', paddingLeft: 8 },
-list: { paddingBottom: 20 },
-emptyList: { flexGrow: 1, justifyContent: 'center', alignItems: 'center' },
-card: {
-backgroundColor: '#FFFFFF',
-borderColor: '#E2E8F0',
-borderRadius: 12,
-borderWidth: 1,
-flexDirection: 'row',
-justifyContent: 'space-between',
-alignItems: 'center',
-marginBottom: 12,
-padding: 16,
-shadowColor: '#000',
-shadowOffset: { width: 0, height: 1 },
-shadowOpacity: 0.05,
-shadowRadius: 2,
-elevation: 2,
-},
-sensorInfo: { flex: 1, paddingRight: 12 },
-titleRow: { alignItems: 'center', flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-sensorCode: { color: '#0F172A', fontSize: 16, fontWeight: '600', letterSpacing: 0.5 },
-sensorType: { color: '#64748B', fontSize: 13, marginTop: 4, textTransform: 'uppercase', fontWeight: '500' },
-statusBadge: { alignItems: 'center', borderRadius: 6, flexDirection: 'row', gap: 6, paddingHorizontal: 8, paddingVertical: 4 },
-activeBadge: { backgroundColor: '#DCFCE7' },
-inactiveBadge: { backgroundColor: '#F1F5F9' },
-statusDot: { borderRadius: 99, height: 6, width: 6 },
-activeDot: { backgroundColor: '#16A34A' },
-inactiveDot: { backgroundColor: '#64748B' },
-statusText: { fontSize: 10, fontWeight: '700', letterSpacing: 0.5 },
-activeText: { color: '#15803D' },
-inactiveText: { color: '#475569' },
-controlRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-switchContainer: { minWidth: 50, alignItems: 'center' },
-queryButton: { backgroundColor: '#0284C7', borderRadius: 6, paddingHorizontal: 12, paddingVertical: 8, minWidth: 80, alignItems: 'center', justifyContent: 'center' },
-queryButtonDisabled: { backgroundColor: '#94A3B8' },
-queryButtonText: { color: '#FFFFFF', fontSize: 12, fontWeight: '600' },
-loading: { alignItems: 'center', flex: 1, justifyContent: 'center', gap: 12 },
-loadingText: { color: '#64748B', fontSize: 14, fontWeight: '500' },
-errorBox: { backgroundColor: '#FEF2F2', borderRadius: 8, borderWidth: 1, borderColor: '#FEE2E2', marginBottom: 16, padding: 16 },
-errorText: { color: '#991B1B', fontSize: 13, lineHeight: 20 },
-retryButton: { marginTop: 10, backgroundColor: '#DC2626', alignSelf: 'flex-start', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 6 },
-retryText: { color: '#FFFFFF', fontSize: 12, fontWeight: '600' },
-emptyText: { color: '#64748B', fontSize: 14, textAlign: 'center' },
+  container: {
+    flex: 1,
+    backgroundColor: COLORS.paper,
+  },
+  centered: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+    paddingVertical: 24,
+  },
+
+  header: {
+    paddingHorizontal: 20,
+    paddingTop: 24,
+    paddingBottom: 12,
+  },
+  title: {
+    fontSize: 30,
+    fontWeight: '800',
+    color: COLORS.ink,
+    letterSpacing: -0.5,
+  },
+  subtitle: {
+    marginTop: 2,
+    fontSize: 15,
+    color: COLORS.muted,
+  },
+
+  listContent: {
+    paddingHorizontal: 16,
+    paddingBottom: 32,
+    flexGrow: 1,
+  },
+  separator: {
+    height: 10,
+  },
+
+  card: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.card,
+    borderRadius: 12,
+    borderLeftWidth: 5,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+  },
+  iconWrap: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  info: {
+    flex: 1,
+    marginLeft: 14,
+  },
+  code: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.ink,
+  },
+  type: {
+    fontSize: 14,
+    color: COLORS.muted,
+    marginTop: 1,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 6,
+  },
+  dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 6,
+  },
+  statusText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  action: {
+    minWidth: 52,
+    alignItems: 'flex-end',
+    justifyContent: 'center',
+  },
+
+  banner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginHorizontal: 16,
+    marginBottom: 10,
+    padding: 12,
+    borderRadius: 10,
+    backgroundColor: COLORS.dangerSoft,
+  },
+  bannerText: {
+    flex: 1,
+    fontSize: 13,
+    color: COLORS.danger,
+  },
+
+  helper: {
+    marginTop: 12,
+    fontSize: 14,
+    lineHeight: 20,
+    color: COLORS.muted,
+    textAlign: 'center',
+  },
+  errorTitle: {
+    marginTop: 12,
+    fontSize: 18,
+    fontWeight: '700',
+    color: COLORS.ink,
+    textAlign: 'center',
+  },
+  retryButton: {
+    marginTop: 20,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 10,
+    backgroundColor: COLORS.ink,
+  },
+  retryText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '600',
+  },
 });
